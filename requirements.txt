@@ -1,2 +1,2 @@
 Pillow>=10.0
-# Optional, for HEIC thumbnails: pillow-heif>=0.13
+pillow-heif>=0.13

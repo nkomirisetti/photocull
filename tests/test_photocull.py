@@ -127,3 +127,95 @@ def test_failed_restore_shows_an_error_in_the_ui(lib, server, page):
     assert "already exists" in toast.inner_text()
     # UI resynced to the server: the photo is still shown as archived.
     assert "arch" in page.get_attribute("#th0", "class")
+
+
+# ---------------------------------------------------------------------------
+# Fujifilm HIF (HEIF) support
+# ---------------------------------------------------------------------------
+
+
+def fetch(url: str) -> tuple[str, bytes]:
+    from urllib.request import urlopen
+
+    with urlopen(url) as r:
+        return r.headers["Content-Type"], r.read()
+
+
+@pytest.fixture
+def hif_lib(tmp_path):
+    folder = tmp_path / "fuji"
+    folder.mkdir()
+    Image.new("RGB", (600, 400), "teal").save(folder / "DSCF0001.HIF", format="HEIF")
+    Image.new("RGB", (600, 400), "navy").save(folder / "DSCF0002.HIF", format="HEIF")
+    return photocull.Library(folder, tmp_path / "fuji_archive")
+
+
+def test_hif_files_are_listed(hif_lib):
+    assert hif_lib.names == ["DSCF0001.HIF", "DSCF0002.HIF"]
+
+
+def test_hif_is_served_as_jpeg_for_any_browser(hif_lib):
+    import io
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), photocull.make_handler(hif_lib))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_port}"
+    try:
+        for route in ("/img/0", "/thumb/0"):
+            ctype, body = fetch(base + route)
+            assert ctype == "image/jpeg"
+            with Image.open(io.BytesIO(body)) as im:
+                assert im.format == "JPEG"
+                assert im.width > im.height  # landscape preserved
+    finally:
+        httpd.shutdown()
+
+
+def test_hif_archive_round_trip_keeps_original_bytes(hif_lib):
+    original = (hif_lib.folder / "DSCF0001.HIF").read_bytes()
+    hif_lib.mark(0, "archive")
+    assert (hif_lib.archive / "DSCF0001.HIF").read_bytes() == original
+    hif_lib.mark(0, "clear")
+    assert (hif_lib.folder / "DSCF0001.HIF").read_bytes() == original
+
+
+def test_thumbnails_respect_exif_orientation(tmp_path):
+    """Portrait shots are stored landscape + an 'rotate 90°' EXIF tag."""
+    p = tmp_path / "portrait.jpg"
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Orientation: rotate 90° CW
+    Image.new("RGB", (600, 400), "red").save(p, exif=exif)
+    with Image.open(photocull.thumb_for(p)) as th:
+        assert th.height > th.width
+
+
+def test_restart_on_another_folder_never_shows_cached_photos(tmp_path, page):
+    """Same port, different folder: the browser must not reuse the previous
+    folder's cached /img/0 — you'd be judging the wrong photo."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    def shown_color():
+        page.wait_for_function("document.getElementById('photo').complete && document.getElementById('photo').naturalWidth > 0")
+        return page.evaluate("""() => {
+            const img = document.getElementById('photo'), c = document.createElement('canvas');
+            c.width = img.naturalWidth; c.height = img.naturalHeight;
+            const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0);
+            return Array.from(ctx.getImageData(5, 5, 1, 1).data.slice(0, 3));
+        }""")
+
+    for color, expected in [("red", (255, 0, 0)), ("blue", (0, 0, 255))]:
+        make_photos(tmp_path / color, 1, color)
+        lib = photocull.Library(tmp_path / color, tmp_path / f"{color}_archive")
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), photocull.make_handler(lib))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            page.goto(f"http://127.0.0.1:{port}/")
+            r, g, b = shown_color()
+            assert max(abs(r - expected[0]), abs(g - expected[1]), abs(b - expected[2])) < 40, (color, (r, g, b))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()

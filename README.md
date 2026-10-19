@@ -42,7 +42,7 @@ Decisions live in `<folder>/.photocull-state.json` (filename → keep/archive), 
 
 ## What it supports
 
-JPG, PNG, WebP, TIFF, GIF, and HEIC (HEIC thumbnails need `pip install pillow-heif`; full-size HEIC display depends on your browser — Safari handles it). Photos are listed in filename order.
+JPG, PNG, WebP, TIFF, GIF, HEIC, and Fujifilm HIF. HEIC/HIF and TIFF are converted to JPEG on the fly for display, so they work in any browser (the originals are never touched). Photos are listed in filename order.
 
 Runs on macOS and Linux. The server only listens on `127.0.0.1` — your photos never leave the machine.
 

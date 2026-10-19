@@ -17,7 +17,7 @@ NOTHING IS EVER DELETED. "Archive" *moves* the file to the archive folder
 moves it back. Decisions are saved to <folder>/.photocull-state.json so
 you can quit and resume any time.
 
-Requires: Pillow (for thumbnails). Optional: pillow-heif for HEIC thumbs.
+Requires: Pillow (for thumbnails). pillow-heif (for HEIC / Fujifilm HIF).
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import mimetypes
+import secrets
 import shutil
 import sys
 import tempfile
@@ -36,18 +37,22 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:
     sys.exit("Pillow is required:  pip install Pillow")
 
 try:
     from pillow_heif import register_heif_opener
+except ImportError:
+    sys.exit("pillow-heif is required for HEIC/HIF:  pip install pillow-heif")
 
-    register_heif_opener()
-except Exception:
-    pass
+register_heif_opener()
 
-SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif", ".heic", ".heif", ".gif"}
+SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif", ".heic", ".heif", ".hif", ".gif"}
+# Formats every browser can show as-is; anything else (HEIC/HIF, TIFF) is
+# converted to a cached JPEG for the full-size view.
+BROWSER_NATIVE = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+DISPLAY_SIZE = 3840  # long edge of converted full-size previews
 STATE_NAME = ".photocull-state.json"
 THUMB_DIR = Path(tempfile.gettempdir()) / "photocull-thumbs"
 THUMB_DIR.mkdir(exist_ok=True)
@@ -63,6 +68,9 @@ class Library:
         self.archive = archive
         self.state_path = folder / STATE_NAME
         self.lock = threading.Lock()
+        # Image URLs are by index, so give each run its own token: otherwise the
+        # browser can show a cached photo from a previous folder at that index.
+        self.session = secrets.token_hex(4)
         self.decisions: dict[str, dict] = {}  # filename -> {"status":..., "as": stored_name}
         self.names: list[str] = []            # stable order: sorted filenames
         self._load()
@@ -123,6 +131,7 @@ class Library:
                 photos.append({"i": i, "name": name, "status": status})
             total = len(self.names)
             return {
+                "session": self.session,
                 "folder": str(self.folder),
                 "archive": str(self.archive),
                 "total": total,
@@ -194,7 +203,7 @@ def thumb_for(path: Path, size: int = 320) -> Path:
     if out.exists():
         return out
     with Image.open(path) as im:
-        im = im.convert("RGB")
+        im = ImageOps.exif_transpose(im).convert("RGB")  # portrait shots stay upright
         im.thumbnail((size, size))
         im.save(out, quality=80)
     return out
@@ -276,6 +285,7 @@ async function load() {
   cur = firstUndecided();
   renderStrip(); show(cur); refreshHeader();
 }
+const imgUrl = (kind, i) => `/${kind}/${i}?s=${S.session}`;
 function firstUndecided(from = 0) {
   for (let k = 0; k < S.total; k++) { const i = (from + k) % S.total; if (!S.photos[i].status) return i; }
   return Math.min(from, S.total - 1);
@@ -294,7 +304,7 @@ function renderStrip() {
     const d = document.createElement('div');
     d.className = 'thumb' + (p.status === 'keep' ? ' keep' : p.status === 'archive' ? ' arch' : '') + (i === cur ? ' current' : '');
     d.id = 'th' + i;
-    d.innerHTML = `<img loading="lazy" src="/thumb/${i}"><div class="n">${p.name}</div>`;
+    d.innerHTML = `<img loading="lazy" src="${imgUrl('thumb', i)}"><div class="n">${p.name}</div>`;
     d.onclick = () => show(i);
     strip.appendChild(d);
   });
@@ -309,14 +319,14 @@ function show(i) {
   document.querySelectorAll('.thumb.current').forEach(e => e.classList.remove('current'));
   cur = Math.max(0, Math.min(i, S.total - 1));
   const p = S.photos[cur];
-  $('photo').src = '/img/' + cur;
+  $('photo').src = imgUrl('img', cur);
   $('caption').textContent = `${cur + 1} / ${S.total} — ${p.name}`;
   const b = $('badge');
   b.className = p.status === 'keep' ? 'keep' : p.status === 'archive' ? 'arch' : '';
   b.textContent = p.status === 'keep' ? '✓ KEPT' : p.status === 'archive' ? '✗ ARCHIVED' : '';
   const el = $('th' + cur); if (el) { el.classList.add('current'); el.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' }); }
   // preload neighbours
-  [cur + 1, cur - 1].forEach(j => { if (j >= 0 && j < S.total) { const im = new Image(); im.src = '/img/' + j; } });
+  [cur + 1, cur - 1].forEach(j => { if (j >= 0 && j < S.total) { const im = new Image(); im.src = imgUrl('img', j); } });
 }
 function recount() {
   S.kept = S.photos.filter(p => p.status === 'keep').length;
@@ -404,7 +414,10 @@ def make_handler(lib: Library):
             elif route.startswith("/img/"):
                 try:
                     i = int(route.split("/")[2])
-                    self._file(lib.current_path(lib.names[i]))
+                    path = lib.current_path(lib.names[i])
+                    if path.suffix.lower() not in BROWSER_NATIVE:
+                        path = thumb_for(path, DISPLAY_SIZE)
+                    self._file(path)
                 except Exception:
                     self.send_error(404)
             elif route.startswith("/thumb/"):
@@ -450,7 +463,7 @@ def main(argv=None) -> int:
 
     lib = Library(folder, archive)
     if not lib.names:
-        print(f"No photos found in {folder} (JPG/PNG/HEIC/WebP/TIFF, top level).")
+        print(f"No photos found in {folder} (JPG/PNG/HEIC/HIF/WebP/TIFF, top level).")
         return 1
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(lib))
