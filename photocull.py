@@ -172,6 +172,13 @@ class Library:
 
     @staticmethod
     def _move(src: Path, dst: Path):
+        # shutil.move silently replaces an existing file, so refuse instead:
+        # a different photo with the same name may have appeared at dst.
+        if dst.exists() and dst.resolve() != src.resolve():
+            raise FileExistsError(
+                f"{dst} already exists — not overwriting it. "
+                f"Rename or move one of them, then try again. (Your photo is safe at {src}.)"
+            )
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
 
@@ -232,6 +239,7 @@ PAGE = r"""<!doctype html>
   .thumb.current img { outline: 3px solid #fff; outline-offset: 1px; opacity: 1; }
   .thumb .n { font-size: 10px; color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #done { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: rgba(0,0,0,.72); font-size: 26px; text-align: center; padding: 20px; }
+  #toast { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); max-width: 70%; display: none; z-index: 2; background: #3a1414; color: #ffb4a8; border: 1px solid #e74c3c; padding: 8px 14px; border-radius: 8px; font-size: 14px; }
   .keys { color: #777; font-size: 12px; }
   kbd { background: #333; border-radius: 4px; padding: 1px 6px; font-family: inherit; }
 </style></head>
@@ -254,6 +262,7 @@ PAGE = r"""<!doctype html>
     <div id="caption"></div>
     <div id="done"><div>🎉 All sorted</div><div class="counts" id="doneCounts"></div>
       <div class="keys">Nothing was deleted — archived photos were only moved. Press ← to review any photo and change it.</div></div>
+    <div id="toast"></div>
   </main>
   <div id="strip"></div>
 </div>
@@ -309,18 +318,37 @@ function show(i) {
   // preload neighbours
   [cur + 1, cur - 1].forEach(j => { if (j >= 0 && j < S.total) { const im = new Image(); im.src = '/img/' + j; } });
 }
-async function mark(action) {
-  if (S.total === 0) return;
+function recount() {
+  S.kept = S.photos.filter(p => p.status === 'keep').length;
+  S.archived = S.photos.filter(p => p.status === 'archive').length;
+  S.left = S.total - S.kept - S.archived;
+}
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => { t.style.display = 'none'; }, 8000);
+}
+// Marks are applied locally right away (so fast K, D, D… each hit the photo
+// that was on screen) and sent to the server one at a time, in order.
+let pending = Promise.resolve();
+function mark(action) {
+  if (!S || S.total === 0) return;
   const i = cur;
-  const r = await (await fetch('/api/mark', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: i, action }) })).json();
-  S.photos[i].status = r.status;
-  S = await (await fetch('/api/photos')).json();
-  S.photos[i].status = r.status;
-  renderStrip();
+  S.photos[i].status = action === 'clear' ? null : action;
+  recount();
+  markStrip(i);
   // fly to the next undecided photo, like a real culling flow
-  const nxt = firstUndecided(i + 1);
-  show(S.left > 0 ? nxt : i);
+  show(S.left > 0 ? firstUndecided(i + 1) : i);
   refreshHeader();
+  pending = pending.then(async () => {
+    const res = await fetch('/api/mark', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: i, action }) });
+    const r = await res.json();
+    if (!res.ok || r.error) throw new Error(r.error || `HTTP ${res.status}`);
+  }).catch(async err => {
+    toast(`Couldn't update ${S.photos[i].name}: ${err.message}`);
+    // the server is the source of truth — resync so the UI matches the files
+    S = await (await fetch('/api/photos')).json();
+    renderStrip(); show(i); refreshHeader();
+  });
 }
 document.addEventListener('keydown', e => {
   if (e.key === 'ArrowRight') { show(cur + 1); e.preventDefault(); }

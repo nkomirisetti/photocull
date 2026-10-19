@@ -46,6 +46,15 @@ JPG, PNG, WebP, TIFF, GIF, and HEIC (HEIC thumbnails need `pip install pillow-he
 
 Runs on macOS and Linux. The server only listens on `127.0.0.1` — your photos never leave the machine.
 
+## Development
+
+```bash
+pip install -e '.[dev]'
+pytest
+```
+
+The browser tests drive your installed Google Chrome via Playwright and are skipped if it isn't available.
+
 ## Ideas / TODO
 
 - [ ] Flag / star rating in addition to keep/archive

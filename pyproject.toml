@@ -13,9 +13,14 @@ dependencies = ["Pillow>=10.0"]
 
 [project.optional-dependencies]
 heic = ["pillow-heif>=0.13"]
+dev = ["pytest>=8", "playwright>=1.40"]
 
 [project.scripts]
 photocull = "photocull:main"
 
 [tool.setuptools]
 py-modules = ["photocull"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
