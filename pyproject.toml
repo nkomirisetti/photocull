@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photocull"
+version = "1.0.0"
+description = "Sort a folder of photos into keep / archive with a fullscreen UI and filmstrip — nothing is ever deleted"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["Pillow>=10.0"]
+
+[project.optional-dependencies]
+heic = ["pillow-heif>=0.13"]
+
+[project.scripts]
+photocull = "photocull:main"
+
+[tool.setuptools]
+py-modules = ["photocull"]
