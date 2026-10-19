@@ -13,15 +13,16 @@ git clone https://github.com/nkomirisetti/photocull.git
 cd photocull
 pip install -r requirements.txt
 
-python3 photocull.py ~/Photos/FujiTrip
+python3 photocull.py                    # pick a folder in the browser
+python3 photocull.py ~/Photos/FujiTrip  # or open one directly
 ```
 
-It starts a local-only web UI at `http://127.0.0.1:8765/` and opens your browser. Ctrl-C to stop; your progress is saved, so rerunning the same command resumes where you left off.
+It starts a local-only web UI at `http://127.0.0.1:8765/` and opens your browser. With no folder it opens a start page: **Choose Folder…** (the native macOS dialog), paste a path, or reopen a recent folder (with how far you got). The 📁 button in the header switches folders any time. Ctrl-C to stop; your progress is saved, so rerunning the same command resumes where you left off.
 
 Options:
 
 ```
-python3 photocull.py FOLDER [--archive FOLDER] [--port 8765] [--no-open]
+python3 photocull.py [FOLDER] [--archive FOLDER] [--port 8765] [--no-open]
 
   --archive   Where archived photos are moved
               (default: a sibling folder named "<folder>_archive")
@@ -34,6 +35,9 @@ python3 photocull.py FOLDER [--archive FOLDER] [--port 8765] [--no-open]
 - **K** — Keep. Green ring on its thumbnail. The file stays where it is.
 - **D** (or **X**) — Archive. Red ring, thumbnail desaturates. The file is *moved* to the archive folder — never deleted.
 - **U** — Unmark / undo. If it was archived, the file moves back.
+- **F** — Full screen: the photo with a small HUD and a dimmed filmstrip overlay (F or Esc to exit).
+- **G** — Grid of every photo. Arrows move the selection, K / D / U mark it, Enter (or G, or a click) opens it.
+- **N** — Arrows skip photos you've already sorted (and the grid shows only unsorted ones). Press again for all photos; remembered between runs.
 - After you mark a photo, it auto-advances to the next unsorted one, so you can just go K, D, D, K… through a whole card.
 - Top-left counter: **"7 left to sort"**, plus kept / archived totals and a progress bar.
 - Finished state tells you the totals and reminds you nothing was deleted.
@@ -42,7 +46,7 @@ Decisions live in `<folder>/.photocull-state.json` (filename → keep/archive), 
 
 ## What it supports
 
-JPG, PNG, WebP, TIFF, GIF, HEIC, and Fujifilm HIF. HEIC/HIF and TIFF are converted to JPEG on the fly for display, so they work in any browser (the originals are never touched). Photos are listed in filename order.
+JPG, PNG, WebP, TIFF, GIF, HEIC, and Fujifilm HIF. In Safari, HEIC/HIF originals are shown directly at full resolution (hardware-decoded). Other browsers get a JPEG preview converted on the fly; the bottom-right label shows which you're seeing. Thumbnails are rendered in the background (via macOS `sips` for HEIC/HIF), and originals are never touched. Photos are listed in filename order.
 
 Runs on macOS and Linux. The server only listens on `127.0.0.1` — your photos never leave the machine.
 
