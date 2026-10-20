@@ -33,13 +33,14 @@ def make_photos(folder: Path, n: int, color="red") -> list[Path]:
 @pytest.fixture
 def lib(tmp_path):
     make_photos(tmp_path / "photos", 3)
-    return photocull.Library(tmp_path / "photos", tmp_path / "photos_archive")
+    return photocull.Library(tmp_path / "photos")
 
 
 @pytest.mark.parametrize("undo_action", ["clear", "keep"])
 def test_unarchive_never_overwrites_a_newer_same_name_photo(lib, undo_action):
     """Archive IMG_001, a *different* IMG_001 shows up in the folder (e.g. a
-    re-import), then undo. The undo must refuse rather than overwrite it."""
+    re-import), then undo. Moving back to the top level must refuse rather
+    than overwrite it; moving to Keep/ doesn't touch it at all."""
     lib.mark(1, "archive")
     archived = lib.archive / "IMG_001.jpg"
     original_bytes = archived.read_bytes()
@@ -48,25 +49,61 @@ def test_unarchive_never_overwrites_a_newer_same_name_photo(lib, undo_action):
     Image.new("RGB", (64, 48), "yellow").save(newcomer)
     newcomer_bytes = newcomer.read_bytes()
 
-    with pytest.raises(FileExistsError):
+    if undo_action == "clear":
+        with pytest.raises(FileExistsError):
+            lib.mark(1, undo_action)
+        assert archived.read_bytes() == original_bytes
+        assert lib.decisions["IMG_001.jpg"]["status"] == "archive"
+    else:
         lib.mark(1, undo_action)
-
-    # Both photos still exist, untouched, and the app still knows where the archived one is.
-    assert newcomer.read_bytes() == newcomer_bytes
-    assert archived.read_bytes() == original_bytes
-    assert lib.decisions["IMG_001.jpg"]["status"] == "archive"
+        assert (lib.keep / "IMG_001.jpg").read_bytes() == original_bytes
+    assert newcomer.read_bytes() == newcomer_bytes  # never overwritten
 
 
 def test_archive_and_undo_round_trip_keeps_every_photo(lib):
-    before = {p.name: p.read_bytes() for p in lib.folder.glob("*.jpg")}
+    before = {p.name: p.read_bytes() for p in lib.folder.rglob("*.jpg")}
     lib.mark(0, "keep")
     lib.mark(1, "archive")
     lib.mark(2, "archive")
     lib.mark(2, "clear")
     lib.mark(1, "keep")
-    after = {p.name: p.read_bytes() for p in lib.folder.glob("*.jpg")}
+    after = {p.name: p.read_bytes() for p in lib.folder.rglob("*.jpg")}
     assert after == before
+    assert sorted(p.name for p in lib.keep.iterdir()) == ["IMG_000.jpg", "IMG_001.jpg"]
     assert not any(lib.archive.glob("*.jpg"))
+    assert (lib.folder / "IMG_002.jpg").exists()
+
+
+def test_status_is_where_the_file_lives(lib):
+    lib.mark(0, "keep")
+    lib.mark(1, "archive")
+    reopened = photocull.Library(lib.folder)  # no state file: the folders are the state
+    assert [reopened.status[n] for n in reopened.names] == ["keep", "archive", None]
+    assert not (lib.folder / photocull.STATE_NAME).exists()
+
+
+def test_old_layout_is_migrated_into_keep_and_archive(tmp_path):
+    import json
+
+    folder = tmp_path / "Trip"
+    make_photos(folder, 4)
+    old_archive = tmp_path / "Trip_archive"
+    old_archive.mkdir()
+    (folder / "IMG_002.jpg").rename(old_archive / "IMG_002_1.jpg")  # archived under a renamed copy
+    (old_archive / ".DS_Store").write_text("")
+    (folder / photocull.STATE_NAME).write_text(json.dumps({"decisions": {
+        "IMG_000.jpg": {"status": "keep"},
+        "IMG_002.jpg": {"status": "archive", "as": "IMG_002_1.jpg"},
+    }}))
+
+    lib = photocull.Library(folder)
+    assert lib.migrated == {"keep": 1, "archive": 1, "skipped": []}
+    assert (folder / "Keep" / "IMG_000.jpg").exists()
+    assert (folder / "Archive" / "IMG_002.jpg").exists()
+    assert not old_archive.exists()  # emptied, so removed
+    assert (folder / f"{photocull.STATE_NAME}.migrated").exists()  # backup kept
+    assert [lib.status[n] for n in lib.names] == ["keep", None, "archive", None]
+    assert photocull.Library(folder).migrated == {}  # only once
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +160,7 @@ def test_rapid_keypresses_mark_the_photo_on_screen(lib, server, page):
 
     statuses = [lib.decisions.get(n, {}).get("status") for n in lib.names]
     assert statuses == ["keep", "archive", "archive"]
-    assert (lib.folder / "IMG_000.jpg").exists()
+    assert (lib.keep / "IMG_000.jpg").exists()
     assert (lib.archive / "IMG_001.jpg").exists()
     assert (lib.archive / "IMG_002.jpg").exists()
 
@@ -162,7 +199,7 @@ def hif_lib(tmp_path):
     folder.mkdir()
     Image.new("RGB", (600, 400), "teal").save(folder / "DSCF0001.HIF", format="HEIF")
     Image.new("RGB", (600, 400), "navy").save(folder / "DSCF0002.HIF", format="HEIF")
-    return photocull.Library(folder, tmp_path / "fuji_archive")
+    return photocull.Library(folder)
 
 
 def test_hif_files_are_listed(hif_lib):
@@ -224,7 +261,7 @@ def test_restart_on_another_folder_never_shows_cached_photos(tmp_path, page):
 
     for color, expected in [("red", (255, 0, 0)), ("blue", (0, 0, 255))]:
         make_photos(tmp_path / color, 1, color)
-        lib = photocull.Library(tmp_path / color, tmp_path / f"{color}_archive")
+        lib = photocull.Library(tmp_path / color)
         httpd = ThreadingHTTPServer(("127.0.0.1", port), photocull.make_handler(lib))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         try:
@@ -279,7 +316,7 @@ def test_prerender_renders_everything_starting_near_the_viewer(tmp_path, monkeyp
     folder.mkdir()
     for i in range(10):
         Image.new("RGB", (120, 80), (i * 20, 0, 0)).save(folder / f"P{i:02}.HIF", format="HEIF")
-    lib = photocull.Library(folder, tmp_path / "many_archive")
+    lib = photocull.Library(folder)
     calls = count_decodes(monkeypatch)
 
     pre = photocull.Prerender(lib, workers=0)  # no threads: drive it by hand
@@ -465,7 +502,7 @@ def test_start_page_picks_a_folder_and_keys_dont_mark_while_typing(app, tmp_path
 @pytest.fixture
 def five(tmp_path):
     make_photos(tmp_path / "five", 5)
-    lib = photocull.Library(tmp_path / "five", tmp_path / "five_archive")
+    lib = photocull.Library(tmp_path / "five")
     lib.mark(1, "keep")
     lib.mark(2, "archive")
     return lib
@@ -538,3 +575,22 @@ def test_grid_with_n_shows_only_unsorted(five, server_for, page):
     page.click("#gc4")
     page.wait_for_selector("main", state="visible")
     assert caption_index(page) == 4
+
+
+
+def test_quit_stops_the_server(lib):
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), photocull.make_handler(lib))
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    assert post(f"http://127.0.0.1:{httpd.server_port}/api/quit")["ok"]
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+
+def test_recents_count_keep_and_archive_subfolders(tmp_path):
+    make_photos(tmp_path / "t", 5)
+    lib = photocull.Library(tmp_path / "t")
+    lib.mark(0, "keep")
+    lib.mark(1, "archive")
+    info = photocull.folder_info(tmp_path / "t")
+    assert (info["sorted"], info["total"]) == (2, 5)

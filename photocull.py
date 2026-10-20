@@ -2,20 +2,17 @@
 """
 PhotoCull — sort a folder of photos into keep / archive, fast.
 
-    python3 photocull.py ~/Photos/FujiTrip
-    python3 photocull.py ~/Photos/FujiTrip --archive ~/Photos/FujiTrip_rejects
+    photocull                      # start page: pick a folder in the browser
+    photocull ~/Photos/FujiTrip    # open a folder directly
 
 Opens a local web UI (127.0.0.1 only):
   - Full-screen photo, filmstrip carousel along the bottom
-  - ← / → to move between photos
-  - K = keep (stays in the folder), D = archive, U = clear the mark
-  - Carousel thumbnails get a green ring for keep, red for archive
-  - Top bar shows how many are left to sort
+  - ← / → to move, K keep, D archive, U undo, F full screen, G grid,
+    N to step through unsorted photos only
 
-NOTHING IS EVER DELETED. "Archive" *moves* the file to the archive folder
-(default: a sibling folder named "<folder>_archive"). Changing your mind
-moves it back. Decisions are saved to <folder>/.photocull-state.json so
-you can quit and resume any time.
+NOTHING IS EVER DELETED. Keep / Archive *move* the file into Keep/ or
+Archive/ inside the folder; undo moves it back. Where a file lives is its
+status, so you can quit and resume any time.
 
 Requires: Pillow (for thumbnails). pillow-heif (for HEIC / Fujifilm HIF).
 """
@@ -63,126 +60,117 @@ THUMB_DIR = Path(tempfile.gettempdir()) / "photocull-thumbs"
 THUMB_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Library: one folder, a list of photos, decisions, archive moves
+# Library: one folder, its photos, and Keep/ + Archive/ inside it
 # ---------------------------------------------------------------------------
+
+KEEP_DIR, ARCHIVE_DIR = "Keep", "Archive"
+
+
+def is_photo(p: Path) -> bool:
+    return p.is_file() and p.suffix.lower() in SUPPORTED and not p.name.startswith(".")
+
+
+def migrate_old_layout(folder: Path) -> dict:
+    """Earlier versions left kept photos in place, moved archived ones to a
+    sibling '<folder>_archive', and remembered decisions in a state file.
+    Move those into Keep/ and Archive/ once; the state file is kept, renamed,
+    as a backup."""
+    state = folder / STATE_NAME
+    if not state.exists():
+        return {}
+    try:
+        decisions = json.loads(state.read_text()).get("decisions", {})
+    except Exception:
+        decisions = {}
+    old_archive = folder.parent / f"{folder.name}_archive"
+    report = {"keep": 0, "archive": 0, "skipped": []}
+    for name, d in decisions.items():
+        status = d.get("status")
+        if status == "keep":
+            src, dst = folder / name, folder / KEEP_DIR / name
+        elif status == "archive":
+            src, dst = old_archive / d.get("as", name), folder / ARCHIVE_DIR / name
+        else:
+            continue
+        if not src.exists():
+            continue
+        if dst.exists():
+            report["skipped"].append(name)  # never overwrite; left where it was
+            continue
+        dst.parent.mkdir(exist_ok=True)
+        shutil.move(str(src), str(dst))
+        report[status] += 1
+    state.rename(folder / f"{STATE_NAME}.migrated")
+    # remove the old archive folder only if nothing but Finder metadata is left
+    if old_archive.is_dir() and {p.name for p in old_archive.iterdir()} <= {".DS_Store"}:
+        (old_archive / ".DS_Store").unlink(missing_ok=True)
+        old_archive.rmdir()
+    return report
 
 
 class Library:
-    def __init__(self, folder: Path, archive: Path):
+    """A photo's status is where it lives: the folder itself (unsorted),
+    Keep/ or Archive/ inside it. Marking moves the file; nothing is deleted."""
+
+    def __init__(self, folder: Path):
         self.folder = folder
-        self.archive = archive
-        self.state_path = folder / STATE_NAME
+        self.keep = folder / KEEP_DIR
+        self.archive = folder / ARCHIVE_DIR
+        self.dirs = {None: folder, "keep": self.keep, "archive": self.archive}
         self.lock = threading.Lock()
         # Image URLs are by index, so give each run its own token: otherwise the
         # browser can show a cached photo from a previous folder at that index.
         self.session = secrets.token_hex(4)
-        self.decisions: dict[str, dict] = {}  # filename -> {"status":..., "as": stored_name}
-        self.names: list[str] = []            # stable order: sorted filenames
-        self._load()
+        self.migrated = migrate_old_layout(folder)
+        self.status: dict[str, str | None] = {}
+        for st, d in self.dirs.items():  # if a name is in two places, the first wins
+            if d.is_dir():
+                for p in d.iterdir():
+                    if is_photo(p) and p.name not in self.status:
+                        self.status[p.name] = st
+        self.names: list[str] = sorted(self.status)  # stable order: by filename
 
-    # -- scanning / persistence -------------------------------------------
-
-    def _scan_files(self) -> list[str]:
-        found = set()
-        if self.folder.exists():
-            for p in self.folder.iterdir():
-                if p.is_file() and p.suffix.lower() in SUPPORTED and not p.name.startswith("."):
-                    found.add(p.name)
-        # Archived photos live in the archive folder; include exactly the
-        # ones this app put there (recorded in decisions), nothing stray.
-        for orig, d in self.decisions.items():
-            if d.get("status") == "archive":
-                stored = self.archive / d.get("as", orig)
-                if stored.exists():
-                    found.add(orig)
-        return sorted(found)
-
-    def _load(self):
-        if self.state_path.exists():
-            try:
-                data = json.loads(self.state_path.read_text())
-                self.decisions = data.get("decisions", {})
-            except Exception:
-                self.decisions = {}
-        self.names = self._scan_files()
-        # Drop decisions for files that no longer exist anywhere
-        self.decisions = {k: v for k, v in self.decisions.items() if k in self.names}
-
-    def _save(self):
-        tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"decisions": self.decisions}, indent=1))
-        tmp.replace(self.state_path)
-
-    # -- paths --------------------------------------------------------------
+    @property
+    def decisions(self) -> dict[str, dict]:
+        return {n: {"status": s} for n, s in self.status.items() if s}
 
     def current_path(self, name: str) -> Path:
-        d = self.decisions.get(name)
-        if d and d.get("status") == "archive":
-            return self.archive / d.get("as", name)
-        return self.folder / name
+        return self.dirs[self.status.get(name)] / name
 
     # -- API surface ----------------------------------------------------------
 
     def summary(self) -> dict:
         with self.lock:
-            photos = []
-            kept = archived = 0
-            for i, name in enumerate(self.names):
-                status = self.decisions.get(name, {}).get("status")
-                if status == "keep":
-                    kept += 1
-                elif status == "archive":
-                    archived += 1
-                photos.append({"i": i, "name": name, "status": status})
-            total = len(self.names)
+            photos = [{"i": i, "name": n, "status": self.status[n]} for i, n in enumerate(self.names)]
+            kept = sum(p["status"] == "keep" for p in photos)
+            archived = sum(p["status"] == "archive" for p in photos)
             return {
                 "session": self.session,
                 "folder": str(self.folder),
+                "keep": str(self.keep),
                 "archive": str(self.archive),
-                "total": total,
+                "migrated": self.migrated,
+                "total": len(photos),
                 "kept": kept,
                 "archived": archived,
-                "left": total - kept - archived,
+                "left": len(photos) - kept - archived,
                 "photos": photos,
             }
 
     def mark(self, index: int, action: str) -> dict:
-        """action: keep | archive | clear. Moves the file when needed."""
+        """action: keep | archive | clear. Moves the file to match."""
+        targets = {"keep": "keep", "archive": "archive", "clear": None}
+        if action not in targets:
+            raise ValueError(f"unknown action {action}")
         with self.lock:
             if not (0 <= index < len(self.names)):
                 raise IndexError("bad index")
             name = self.names[index]
-            current = self.current_path(name)
-            status = self.decisions.get(name, {}).get("status")
-
-            if action == "clear":
-                if status == "archive" and current.exists():
-                    self._move(current, self.folder / name)
-                self.decisions.pop(name, None)
-
-            elif action == "keep":
-                if status == "archive" and current.exists():
-                    self._move(current, self.folder / name)
-                self.decisions[name] = {"status": "keep"}
-
-            elif action == "archive":
-                if status != "archive":
-                    self.archive.mkdir(parents=True, exist_ok=True)
-                    dest = self.archive / name
-                    if dest.exists() and dest.resolve() != current.resolve():
-                        stem, suf, n = dest.stem, dest.suffix, 1
-                        while dest.exists():
-                            dest = self.archive / f"{stem}_{n}{suf}"
-                            n += 1
-                    stored = dest.name
-                    if current.exists():
-                        self._move(current, dest)
-                    self.decisions[name] = {"status": "archive", "as": stored}
-            else:
-                raise ValueError(f"unknown action {action}")
-
-            self._save()
-            return {"name": name, "status": self.decisions.get(name, {}).get("status")}
+            target = targets[action]
+            if target != self.status[name]:
+                self._move(self.current_path(name), self.dirs[target] / name)
+                self.status[name] = target
+            return {"name": name, "status": target}
 
     @staticmethod
     def _move(src: Path, dst: Path):
@@ -342,7 +330,9 @@ PAGE = r"""<!doctype html>
   .recent .bar { height: 3px; background: #333; border-radius: 2px; overflow: hidden; margin-top: 4px; }
   .recent .bar div { height: 100%; background: linear-gradient(90deg, #2ecc71, #ffd75e); }
   .recent .prog { color: #aaa; font-size: 12px; }
-  #pickBack { align-self: flex-start; margin-top: 10px; }
+  .pickFoot { display: flex; gap: 10px; margin-top: 10px; }
+  #btnQuit { margin-left: auto; color: #aaa; }
+  #stopped { display: none; min-height: 100vh; align-items: center; justify-content: center; flex-direction: column; gap: 8px; text-align: center; padding: 16px; }
   #counter { font-size: 20px; font-weight: 700; }
   #counter .left { color: #ffd75e; }
   .counts { color: #aaa; font-size: 13px; }
@@ -413,9 +403,11 @@ PAGE = r"""<!doctype html>
     <div id="pickErr"></div>
     <h2 id="recentsTitle">Recent</h2>
     <div id="recents"></div>
-    <button id="pickBack">← Back to <span id="pickBackName"></span></button>
+    <div class="pickFoot"><button id="pickBack">← Back to <span id="pickBackName"></span></button>
+      <button id="btnQuit" title="Stop PhotoCull. Your progress is already saved.">Quit PhotoCull</button></div>
   </div>
 </div>
+<div id="stopped"><h1>PhotoCull has stopped</h1><p class="muted">Your progress is saved. You can close this tab — open PhotoCull again any time.</p></div>
 <div id="app">
   <header>
     <div>
@@ -439,7 +431,7 @@ PAGE = r"""<!doctype html>
     <div id="caption"></div>
     <div id="res"></div>
     <div id="done"><div>🎉 All sorted</div><div class="counts" id="doneCounts"></div>
-      <div class="keys">Nothing was deleted — archived photos were only moved. Press ← to review any photo and change it.</div></div>
+      <div class="keys">Nothing was deleted — photos were only moved into Keep/ and Archive/. Press ← to review any photo and change it.</div></div>
     <div id="toast"></div>
   </main>
   <div id="grid"></div>
@@ -455,6 +447,8 @@ async function load() {
   if (S.total === 0) { $('counter').textContent = 'No photos found in that folder'; return; }
   cur = firstUndecided();
   updateModeUI();
+  const m = S.migrated;
+  if (m && (m.keep || m.archive)) toast(`Moved ${m.keep} kept photos into Keep/ and ${m.archive} into Archive/ — the new folder layout`, 'info');
   renderStrip(); show(cur); refreshHeader();
 }
 const imgUrl = (kind, i) => `/${kind}/${i}?s=${S.session}`;
@@ -474,7 +468,7 @@ function refreshHeader() {
   $('counter').innerHTML = S.left > 0 ? `<span class="left">${S.left} left</span> to sort` : 'All sorted';
   $('counts').innerHTML = `of ${S.total} · <b class="keep">${S.kept} kept</b> · <b class="arch">${S.archived} archived</b>`;
   $('folderName').textContent = S.folder.split('/').pop();
-  $('btnFolder').title = `${S.folder}\nArchive: ${S.archive}\nClick to change folder`;
+  $('btnFolder').title = `${S.folder}\nKeep → ${S.keep}\nArchive → ${S.archive}\nClick to change folder`;
   const pct = (S.total ? (100 * (S.total - S.left) / S.total) : 100) + '%';
   $('progressBar').style.width = pct; $('hudFill').style.width = pct;
   $('hudLeft').textContent = S.left > 0 ? `${S.left} left` : 'All sorted';
@@ -711,6 +705,11 @@ $('pathForm').onsubmit = e => { e.preventDefault(); openFolder($('pathInput').va
 $('btnFolder').onclick = showPicker;
 $('modeChip').onclick = toggleUnsorted;
 $('pickBack').onclick = hidePicker;
+$('btnQuit').onclick = async () => {
+  await pending;  // let any marks land first
+  await fetch('/api/quit', { method: 'POST' });
+  $('picker').style.display = 'none'; $('app').style.display = 'none'; $('stopped').style.display = 'flex';
+};
 $('btnKeep').onclick = () => mark('keep');
 $('btnArch').onclick = () => mark('archive');
 load();
@@ -722,23 +721,20 @@ RECENTS_PATH = Path.home() / ".config" / "photocull" / "recent.json"
 OSASCRIPT = shutil.which("osascript") if sys.platform == "darwin" else None
 
 
-def default_archive(folder: Path) -> Path:
-    return folder.parent / f"{folder.name}_archive"
-
-
 def folder_info(folder: Path) -> dict:
     """Name, photo count and sorting progress, for the start page."""
     info = {"path": str(folder), "name": folder.name, "exists": folder.is_dir(), "total": 0, "sorted": 0}
     if info["exists"]:
-        try:
-            decisions = json.loads((folder / STATE_NAME).read_text()).get("decisions", {})
-        except Exception:
-            decisions = {}
-        here = {p.name for p in folder.iterdir()
-                if p.is_file() and p.suffix.lower() in SUPPORTED and not p.name.startswith(".")}
-        archived = {k for k, v in decisions.items() if v.get("status") == "archive"}
-        info["total"] = len(here | archived)
-        info["sorted"] = sum(1 for k in decisions if k in here or k in archived)
+        count = lambda d: sum(1 for p in d.iterdir() if is_photo(p)) if d.is_dir() else 0
+        unsorted, kept, archived = count(folder), count(folder / KEEP_DIR), count(folder / ARCHIVE_DIR)
+        info["total"], info["sorted"] = unsorted + kept + archived, kept + archived
+        if (folder / STATE_NAME).exists():  # old layout, not opened since: estimate from its state file
+            try:
+                old = json.loads((folder / STATE_NAME).read_text()).get("decisions", {})
+                archived_old = sum(v.get("status") == "archive" for v in old.values())
+                info["total"], info["sorted"] = unsorted + archived_old, len(old)
+            except Exception:
+                pass
     return info
 
 
@@ -752,11 +748,11 @@ class App:
         self.prerender: Prerender | None = None
         self.lock = threading.Lock()
 
-    def open(self, folder: Path, archive: Path | None = None) -> Library:
+    def open(self, folder: Path) -> Library:
         folder = folder.expanduser().resolve()
         if not folder.is_dir():
             raise ValueError(f"Not a folder: {folder}")
-        lib = Library(folder, (archive.expanduser().resolve() if archive else default_archive(folder)))
+        lib = Library(folder)
         if not lib.names:
             raise ValueError(f"No photos in {folder} (JPG/PNG/HEIC/HIF/WebP/TIFF, top level only)")
         with self.lock:
@@ -881,6 +877,9 @@ def make_handler(app: App | Library, prerender: Prerender | None = None):
                 if route == "/api/open":
                     opened = app.open(Path(str(self._body()["path"])))
                     self._json({"ok": True, "folder": str(opened.folder)})
+                elif route == "/api/quit":
+                    self._json({"ok": True})
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
                 elif route == "/api/choose":
                     if not OSASCRIPT:
                         raise ValueError("The folder dialog is only available on macOS")
@@ -903,7 +902,6 @@ def make_handler(app: App | Library, prerender: Prerender | None = None):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="photocull", description="Sort a folder of photos into keep / archive. Nothing is ever deleted.")
     ap.add_argument("folder", type=Path, nargs="?", help="Folder of photos to sort (top level only). Omit to pick one in the browser.")
-    ap.add_argument("--archive", type=Path, default=None, help="Archive folder (default: '<folder>_archive' next to it)")
     ap.add_argument("--port", type=int, default=8765, help="Local port (default: 8765)")
     ap.add_argument("--no-open", action="store_true", help="Don't auto-open the browser")
     args = ap.parse_args(argv)
@@ -911,13 +909,18 @@ def main(argv=None) -> int:
     app = App(workers=max(1, (os.cpu_count() or 2) // 2))
     if args.folder:
         try:
-            lib = app.open(args.folder, args.archive)
+            lib = app.open(args.folder)
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
         print(f"PhotoCull: {len(lib.names)} photos in {lib.folder}")
-        print(f"  keep    -> stays in {lib.folder}")
-        print(f"  archive -> moves to {lib.archive}  (nothing is ever deleted)")
+        print(f"  K keep    -> moves to {lib.keep}")
+        print(f"  D archive -> moves to {lib.archive}  (nothing is ever deleted)")
+        if lib.migrated:
+            m = lib.migrated
+            print(f"  Moved {m['keep']} kept photos into Keep/ and {m['archive']} archived into Archive/ (new layout).")
+            if m["skipped"]:
+                print(f"  Left in place (a file with that name was already there): {', '.join(m['skipped'])}")
     else:
         print("PhotoCull: pick a folder in the browser.")
 
